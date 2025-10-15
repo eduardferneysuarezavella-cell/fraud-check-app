@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # Token Validator API (using MongoDB Atlas cloud)
+  api:
+    build: .
+    container_name: token_validator_api
+    environment:
+      MONGO_USERNAME: eduardferneysuarezavella_db_user
+      MONGO_PASSWORD: vhDysowvcLqIGAwh
+      MONGO_CLUSTER: cluster0.wbhlzwe.mongodb.net
+      MONGO_DB_NAME: shopify_tokens
+      PORT: 3000
+      NODE_ENV: production
+      ALLOWED_ORIGINS: "*"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/admin/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - ./admin-dashboard.html:/app/admin-dashboard.html:ro
+
+  # Redis (optional, for caching)
+  redis:
+    image: redis:7-alpine
+    container_name: token_validator_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - with-redis
+
+volumes:
+  redis_data:
+
