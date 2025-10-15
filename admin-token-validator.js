@@ -626,11 +626,17 @@ app.post('/api/validate', async (req, res) => {
           valid: false,
           error: 'Invalid checkout session. This checkout URL cannot be used from a different browser or device. Please return to your cart and checkout again.' 
         });
+      } else {
+        if (attemptExists.attempt_id === attempt_id)  {
+          // This is the same user, allow to continue
+          console.log('✅ Session token matches - same user');
+          return res.status(200).json({ 
+            success: true,
+            valid: true,
+            message: 'Checkout validated successfully' 
+          });
+        }
       }
-      
-      // Session matches - this is the same user, allow to continue
-      console.log('✅ Session token matches - same user');
-      
     } else {
       // Attempt ID doesn't exist at all
       await logValidation(attempt_id, session_token, 'invalid', 'Attempt not found', ip_address, user_agent);
