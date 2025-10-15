@@ -81,7 +81,7 @@ const MONGO_PASSWORD = process.env.MONGO_PASSWORD || 'vhDysowvcLqIGAwh';
 const MONGO_CLUSTER = process.env.MONGO_CLUSTER || 'cluster0.wbhlzwe.mongodb.net';
 const MONGO_DB_NAME = process.env.MONGO_DB_NAME || 'shopify_tokens';
 
-const MONGO_URI = `mongodb+srv://${MONGO_USERNAME}:${MONGO_PASSWORD}@${MONGO_CLUSTER}/?retryWrites=true&w=majority&appName=${MONGO_DB_NAME}`;
+const MONGO_URI = `mongodb+srv://${MONGO_USERNAME}:${MONGO_PASSWORD}@${MONGO_CLUSTER}/?retryWrites=true&w=majority&appName=${MONGO_DB_NAME}&ssl=true`;
 
 const mongoClient = new MongoClient(MONGO_URI, {
   serverApi: {
