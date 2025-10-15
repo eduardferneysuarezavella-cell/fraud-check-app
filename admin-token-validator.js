@@ -7,6 +7,9 @@
  * Tech Stack: Node.js + Express + MongoDB
  */
 
+// Load environment variables first
+require('dotenv').config();
+
 const express = require('express');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const crypto = require('crypto');
