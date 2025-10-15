@@ -85,7 +85,15 @@ const mongoClient = new MongoClient(MONGO_URI, {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
-  }
+  },
+  tls: true,
+  tlsAllowInvalidCertificates: false,
+  tlsAllowInvalidHostnames: false,
+  connectTimeoutMS: 30000,
+  socketTimeoutMS: 30000,
+  serverSelectionTimeoutMS: 30000,
+  maxPoolSize: 10,
+  minPoolSize: 2,
 });
 
 let db;
