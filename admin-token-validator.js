@@ -434,13 +434,21 @@ app.post('/api/attempt/register', async (req, res) => {
 
 /**
  * POST /api/shopify/validate
- * Endpoint for Shopify Functions to validate and mark tokens as used
- * This enforces ONE-TIME use at the Shopify Function level
+ * [DEPRECATED - NOT CURRENTLY USED]
+ * 
+ * Originally intended for Shopify Functions, but Shopify Functions 
+ * do not have access to fetch() API for making HTTP requests.
+ * 
+ * Current implementation uses Checkout UI Extension instead,
+ * which calls /api/validate endpoint.
+ * 
+ * Keeping this endpoint for future use if Shopify adds network 
+ * capabilities to Functions.
  */
 app.post('/api/shopify/validate', async (req, res) => {
   try {
     let { session_token, attempt_id, buyer_journey_step } = req.body;
-    
+    console.log('🔍 Shopify validation request:', { session_token: session_token?.substring(0, 20), attempt_id: attempt_id?.substring(0, 20), buyer_journey_step });
     // Extract IP from request if not provided
     if (!req.body.ip_address) {
       const ip_address = req.headers['x-forwarded-for']?.split(',')[0]?.trim() 
@@ -554,13 +562,15 @@ app.post('/api/shopify/validate', async (req, res) => {
 
 /**
  * POST /api/validate
- * Legacy endpoint for theme-based validation
+ * Endpoint for Checkout UI Extension and theme-based validation
+ * Used by: checkout_ui_extension, theme
  */
 app.post('/api/validate', async (req, res) => {
   try {
     let { 
       attempt_id, 
-      session_token, 
+      session_token,
+      source, // 'checkout_ui_extension' or 'theme'
       ip_address, 
       user_agent 
     } = req.body;
@@ -574,6 +584,16 @@ app.post('/api/validate', async (req, res) => {
                    || 'unknown';
     }
     
+    // Set user agent based on source if not provided
+    if (!user_agent) {
+      user_agent = source || req.headers['user-agent'] || 'unknown';
+    }
+    
+    console.log(`🔍 Validation request from: ${source || 'unknown'}`);
+    console.log(`   Attempt ID: ${attempt_id?.substring(0, 20)}...`);
+    console.log(`   Session Token: ${session_token?.substring(0, 20)}...`);
+    console.log(`   IP Address: ${ip_address}`);
+    
     if (!attempt_id || !session_token) {
       await logValidation(null, null, 'invalid', 'Missing parameters', ip_address, user_agent);
       return res.status(400).json({ 
@@ -582,19 +602,46 @@ app.post('/api/validate', async (req, res) => {
       });
     }
     
-    // Check attempt exists and session matches
-    const attempt = await attemptsCollection.findOne({ 
-      attempt_id, 
-      session_token 
-    });
+    // ===== CRITICAL SECURITY CHECK =====
+    // Check if attempt_id exists with ANY session_token first
+    const attemptExists = await attemptsCollection.findOne({ attempt_id });
     
-    if (!attempt) {
+    if (attemptExists) {
+      // Attempt ID exists - now check if session_token matches
+      if (attemptExists.session_token !== session_token) {
+        // FRAUD DETECTED: Someone is trying to use a checkout URL with a different session
+        // This means they copied the /checkout/cn/... URL to another browser/device
+        console.error('🚨 FRAUD ATTEMPT DETECTED!');
+        console.error(`   Attempt ID: ${attempt_id.substring(0, 20)}...`);
+        console.error(`   Original Session: ${attemptExists.session_token.substring(0, 20)}...`);
+        console.error(`   Provided Session: ${session_token.substring(0, 20)}...`);
+        console.error(`   IP Address: ${ip_address}`);
+        
+        await logValidation(attempt_id, session_token, 'session_mismatch', 
+          'FRAUD: Attempt ID used with different session token (copied checkout URL)', 
+          ip_address, user_agent);
+        
+        return res.status(403).json({ 
+          success: false,
+          valid: false,
+          error: 'Invalid checkout session. This checkout URL cannot be used from a different browser or device. Please return to your cart and checkout again.' 
+        });
+      }
+      
+      // Session matches - this is the same user, allow to continue
+      console.log('✅ Session token matches - same user');
+      
+    } else {
+      // Attempt ID doesn't exist at all
       await logValidation(attempt_id, session_token, 'invalid', 'Attempt not found', ip_address, user_agent);
       return res.status(404).json({ 
         success: false, 
-        error: 'Attempt not found or session mismatch' 
+        error: 'Checkout attempt not found. Please return to cart and try again.' 
       });
     }
+    
+    // At this point, we know the attempt exists AND the session matches
+    const attempt = attemptExists;
     
     // Check if already used
     if (attempt.is_used) {
@@ -693,6 +740,7 @@ app.get('/api/admin/stats', async (req, res) => {
       reuse_attempts: 0,
       expired_attempts: 0,
       invalid_attempts: 0,
+      fraud_attempts: 0, // Session mismatch = copied checkout URL
       total_validations: 0
     };
     
@@ -702,6 +750,7 @@ app.get('/api/admin/stats', async (req, res) => {
       if (stat._id === 'already_used') statsMap.reuse_attempts = stat.count;
       if (stat._id === 'expired') statsMap.expired_attempts = stat.count;
       if (stat._id === 'invalid') statsMap.invalid_attempts = stat.count;
+      if (stat._id === 'session_mismatch') statsMap.fraud_attempts = stat.count;
     });
     
     const now = new Date();
@@ -939,9 +988,9 @@ async function startServer() {
       console.log('\n' + '='.repeat(50));
       console.log(`✅ Token Validator API running on port ${PORT}`);
       console.log('='.repeat(50));
-      console.log(`📊 Admin Dashboard: http://localhost:${PORT}/`);
-      console.log(`📈 Admin Stats API: http://localhost:${PORT}/api/admin/stats`);
-      console.log(`📝 Admin Logs API: http://localhost:${PORT}/api/admin/logs`);
+      console.log(`📊 Admin Dashboard: https://fraud-check-app.onrender.com:${PORT}/`);
+      console.log(`📈 Admin Stats API: https://fraud-check-app.onrender.com:${PORT}/api/admin/stats`);
+      console.log(`📝 Admin Logs API: https://fraud-check-app.onrender.com:${PORT}/api/admin/logs`);
       console.log('\n🔗 Available Endpoints:');
       console.log('   POST /api/session/register');
       console.log('   POST /api/attempt/register');

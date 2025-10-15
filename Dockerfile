@@ -21,7 +21,7 @@ EXPOSE 3000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3000/api/admin/stats || exit 1
+  CMD curl -f https://fraud-check-app.onrender.com/api/admin/stats || exit 1
 
 # Start application
 CMD ["node", "admin-token-validator.js"]
