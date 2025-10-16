@@ -562,24 +562,23 @@ app.post('/api/shopify/validate', async (req, res) => {
 
 /**
  * POST /api/validate
- * NEW TRIPLET VALIDATION - Implements checkout_storage_id verification
- * Validates: (session_token, attemptID, checkout_storage_id)
+ * PAIR VALIDATION - Implements checkout_storage_id verification
+ * Validates: (session_token, checkout_storage_id)
  * 
  * Flow:
- * 1. Theme registers at cart: (session_token, attemptID, null)
- * 2. Extension sends at checkout: (session_token, attemptID, checkout_storage_id)
+ * 1. Theme registers at cart: (session_token) with checkout_storage_id = null
+ * 2. Extension sends at checkout: (session_token, checkout_storage_id)
  * 3. Backend validates:
- *    - If all three match → ALLOW (same browser, refresh)
- *    - If session+attempt match, storage_id is null in DB → ALLOW + UPDATE (first legitimate checkout)
- *    - If session+attempt match, storage_id differs → BLOCK (copied URL, different browser)
+ *    - If both match → ALLOW (same browser, refresh)
+ *    - If session matches, storage_id is null in DB → ALLOW + UPDATE (first legitimate checkout)
+ *    - If session matches, storage_id differs → BLOCK (copied URL, different browser)
  *    - If no match → BLOCK (invalid)
  */
 app.post('/api/validate', async (req, res) => {
   try {
     let { 
-      attempt_id, 
       session_token,
-      checkout_storage_id, // NEW: Browser-specific storage ID from extension
+      checkout_storage_id, // Browser-specific storage ID from extension
       source, // 'checkout_ui_extension' or 'theme'
       ip_address, 
       user_agent 
@@ -601,34 +600,32 @@ app.post('/api/validate', async (req, res) => {
     
     console.log(`🔍 VALIDATION REQUEST from: ${source || 'unknown'}`);
     console.log(`   Session Token: ${session_token?.substring(0, 20)}...`);
-    console.log(`   Attempt ID: ${attempt_id?.substring(0, 20)}...`);
     console.log(`   Checkout Storage ID: ${checkout_storage_id?.substring(0, 20) || 'NULL'}...`);
     console.log(`   IP Address: ${ip_address}`);
     
     // Validate required parameters
-    if (!attempt_id || !session_token) {
-      console.error('❌ Missing required parameters (session_token or attempt_id)');
-      await logValidation(null, null, 'invalid', 'Missing required parameters', ip_address, user_agent);
+    if (!session_token) {
+      console.error('❌ Missing required parameter: session_token');
+      await logValidation(null, null, 'invalid', 'Missing session_token', ip_address, user_agent);
       return res.status(400).json({ 
         success: false, 
-        error: 'session_token and attempt_id are required' 
+        error: 'session_token is required' 
       });
     }
     
-    // If request is from theme (no checkout_storage_id), use OLD validation logic
+    // If request is from theme (no checkout_storage_id), use simple validation
     if (!checkout_storage_id || source === 'theme') {
-      console.log('⚠️ Theme validation (no checkout_storage_id) - using legacy validation');
+      console.log('⚠️ Theme validation (no checkout_storage_id) - using simple validation');
       
-      // Find the attempt
-      const dbRecord = await attemptsCollection.findOne({ 
-        session_token, 
-        attempt_id 
+      // Find the session
+      const dbRecord = await sessionsCollection.findOne({ 
+        session_token
       });
       
       if (!dbRecord) {
-        console.error('🚨 INVALID: No matching session_token + attempt_id');
-        await logValidation(attempt_id, session_token, 'not_found', 
-          'No matching session and attempt', ip_address, user_agent);
+        console.error('🚨 INVALID: No matching session_token');
+        await logValidation(null, session_token, 'not_found', 
+          'No matching session', ip_address, user_agent);
         return res.status(404).json({ 
           success: false,
           valid: false,
@@ -639,7 +636,7 @@ app.post('/api/validate', async (req, res) => {
       // Theme validation - just check if exists and not expired
       if (dbRecord.expires_at && new Date() > new Date(dbRecord.expires_at)) {
         console.error('⏰ EXPIRED: Checkout session expired');
-        await logValidation(attempt_id, session_token, 'expired', 
+        await logValidation(null, session_token, 'expired', 
           'Session expired', ip_address, user_agent);
         return res.status(400).json({ 
           success: false,
@@ -649,7 +646,7 @@ app.post('/api/validate', async (req, res) => {
       }
       
       console.log('✅ Theme validation PASSED');
-      await logValidation(attempt_id, session_token, 'success', 
+      await logValidation(null, session_token, 'success', 
         'Theme validation successful', ip_address, user_agent);
       
       return res.status(200).json({ 
@@ -660,21 +657,20 @@ app.post('/api/validate', async (req, res) => {
       });
     }
     
-    // ===== TRIPLET VALIDATION (Extension with checkout_storage_id) =====
-    console.log('🔒 TRIPLET VALIDATION MODE - checkout_storage_id provided');
+    // ===== PAIR VALIDATION (Extension with checkout_storage_id) =====
+    console.log('🔒 PAIR VALIDATION MODE - checkout_storage_id provided');
     
-    // ===== TRIPLET VALIDATION LOGIC =====
-    // Find the record with matching session_token and attempt_id
-    const dbRecord = await attemptsCollection.findOne({ 
-      session_token, 
-      attempt_id 
+    // ===== PAIR VALIDATION LOGIC =====
+    // Find the record with matching session_token
+    const dbRecord = await sessionsCollection.findOne({ 
+      session_token
     });
     
     if (!dbRecord) {
-      // Case D: No matching (session_token, attempt_id) in DB → BLOCK
-      console.error('🚨 INVALID: No matching session_token + attempt_id in database');
-      await logValidation(attempt_id, session_token, 'not_found', 
-        'No matching session and attempt', ip_address, user_agent);
+      // No matching session_token in DB → BLOCK
+      console.error('🚨 INVALID: No matching session_token in database');
+      await logValidation(null, session_token, 'not_found', 
+        'No matching session', ip_address, user_agent);
       return res.status(404).json({ 
         success: false,
         valid: false,
@@ -682,10 +678,10 @@ app.post('/api/validate', async (req, res) => {
       });
     }
     
-    // Check if session/attempt has expired
+    // Check if session has expired
     if (dbRecord.expires_at && new Date() > new Date(dbRecord.expires_at)) {
       console.error('⏰ EXPIRED: Checkout session expired');
-      await logValidation(attempt_id, session_token, 'expired', 
+      await logValidation(null, session_token, 'expired', 
         'Session expired', ip_address, user_agent);
       return res.status(400).json({ 
         success: false,
@@ -698,12 +694,12 @@ app.post('/api/validate', async (req, res) => {
     
     // Now check checkout_storage_id
     if (!dbRecord.checkout_storage_id || dbRecord.checkout_storage_id === '') {
-      // Case B: session_token + attempt_id match, but checkout_storage_id is NULL in DB
+      // Case B: session_token matches, but checkout_storage_id is NULL in DB
       // This is the FIRST legitimate checkout → ALLOW + UPDATE
       console.log('✅ FIRST CHECKOUT: checkout_storage_id is NULL in DB → Storing new checkout_storage_id');
       
-      const updateResult = await attemptsCollection.updateOne(
-        { session_token, attempt_id, checkout_storage_id: { $in: [null, ''] } },
+      const updateResult = await sessionsCollection.updateOne(
+        { session_token, checkout_storage_id: { $in: [null, ''] } },
         { 
           $set: { 
             checkout_storage_id: checkout_storage_id,
@@ -717,12 +713,12 @@ app.post('/api/validate', async (req, res) => {
         // Race condition: another request just updated it
         console.error('⚠️ RACE CONDITION: checkout_storage_id was just set by another request');
         // Re-fetch and compare
-        const updatedRecord = await attemptsCollection.findOne({ session_token, attempt_id });
+        const updatedRecord = await sessionsCollection.findOne({ session_token });
         if (updatedRecord.checkout_storage_id === checkout_storage_id) {
           console.log('✅ Same checkout_storage_id - allowing');
         } else {
           console.error('🚨 Different checkout_storage_id - blocking');
-          await logValidation(attempt_id, session_token, 'storage_mismatch', 
+          await logValidation(null, session_token, 'storage_mismatch', 
             'Different checkout_storage_id (copied URL)', ip_address, user_agent);
           return res.status(403).json({ 
             success: false,
@@ -732,7 +728,7 @@ app.post('/api/validate', async (req, res) => {
         }
       }
       
-      await logValidation(attempt_id, session_token, 'success', 
+      await logValidation(null, session_token, 'success', 
         'First checkout - storage_id stored', ip_address, user_agent);
       
       console.log('✅ VALIDATION PASSED - First legitimate checkout');
@@ -744,12 +740,12 @@ app.post('/api/validate', async (req, res) => {
       });
       
     } else if (dbRecord.checkout_storage_id === checkout_storage_id) {
-      // Case A: All three match → ALLOW (same browser, refresh or revisit)
-      console.log('✅ ALL MATCH: Same browser refresh/revisit');
+      // Case A: Both match → ALLOW (same browser, refresh or revisit)
+      console.log('✅ BOTH MATCH: Same browser refresh/revisit');
       
       // Update last validated time
-      await attemptsCollection.updateOne(
-        { session_token, attempt_id },
+      await sessionsCollection.updateOne(
+        { session_token },
         { 
           $set: { 
             last_validated_at: new Date()
@@ -757,7 +753,7 @@ app.post('/api/validate', async (req, res) => {
         }
       );
       
-      await logValidation(attempt_id, session_token, 'success', 
+      await logValidation(null, session_token, 'success', 
         'Same browser validation', ip_address, user_agent);
       
       console.log('✅ VALIDATION PASSED - Same browser');
@@ -769,14 +765,14 @@ app.post('/api/validate', async (req, res) => {
       });
       
     } else {
-      // Case C: session_token + attempt_id match, but checkout_storage_id is DIFFERENT
+      // Case C: session_token matches, but checkout_storage_id is DIFFERENT
       // This is a COPIED URL from different browser → BLOCK
       console.error('🚨 COPIED URL DETECTED!');
       console.error(`   Expected checkout_storage_id: ${dbRecord.checkout_storage_id.substring(0, 20)}...`);
       console.error(`   Provided checkout_storage_id: ${checkout_storage_id.substring(0, 20)}...`);
       console.error(`   This checkout URL was copied to a different browser!`);
       
-      await logValidation(attempt_id, session_token, 'storage_mismatch', 
+      await logValidation(null, session_token, 'storage_mismatch', 
         'FRAUD: Different checkout_storage_id (copied URL to different browser)', 
         ip_address, user_agent);
       
@@ -790,7 +786,7 @@ app.post('/api/validate', async (req, res) => {
     
   } catch (error) {
     console.error('Validation error:', error);
-    await logValidation(req.body.attempt_id, req.body.session_token, 'error', 
+    await logValidation(null, req.body.session_token, 'error', 
       error.message, req.body.ip_address, req.body.user_agent);
     res.status(500).json({ 
       success: false, 
