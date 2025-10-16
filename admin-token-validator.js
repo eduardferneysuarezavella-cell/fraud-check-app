@@ -101,7 +101,6 @@ const mongoClient = new MongoClient(MONGO_URI, {
 
 let db;
 let sessionsCollection;
-let attemptsCollection;
 let logsCollection;
 
 // ============================================
@@ -117,20 +116,14 @@ async function initDatabase() {
     // Get database and collections
     db = mongoClient.db(MONGO_DB_NAME);
     sessionsCollection = db.collection('checkout_sessions');
-    attemptsCollection = db.collection('checkout_attempts');
     logsCollection = db.collection('validation_logs');
     
     // Create indexes for performance
     await sessionsCollection.createIndex({ session_token: 1 }, { unique: true });
     await sessionsCollection.createIndex({ expires_at: 1 });
-    await sessionsCollection.createIndex({ is_used: 1 });
+    await sessionsCollection.createIndex({ checkout_storage_id: 1 });
     
-    await attemptsCollection.createIndex({ attempt_id: 1 }, { unique: true });
-    await attemptsCollection.createIndex({ session_token: 1 });
-    await attemptsCollection.createIndex({ expires_at: 1 });
-    await attemptsCollection.createIndex({ is_used: 1 });
-    
-    await logsCollection.createIndex({ attempt_id: 1 });
+    await logsCollection.createIndex({ session_token: 1 });
     await logsCollection.createIndex({ validation_result: 1 });
     await logsCollection.createIndex({ created_at: -1 });
     
@@ -157,17 +150,12 @@ async function cleanupExpiredTokens() {
   try {
     const now = new Date();
     
-    const attemptsResult = await attemptsCollection.deleteMany({
-      expires_at: { $lt: now }
-    });
-    
     const sessionsResult = await sessionsCollection.deleteMany({
       expires_at: { $lt: now }
     });
     
-    const total = attemptsResult.deletedCount + sessionsResult.deletedCount;
-    console.log(`🧹 Cleaned up ${attemptsResult.deletedCount} expired attempts and ${sessionsResult.deletedCount} expired sessions`);
-    return total;
+    console.log(`🧹 Cleaned up ${sessionsResult.deletedCount} expired sessions`);
+    return sessionsResult.deletedCount;
   } catch (error) {
     console.error('Cleanup error:', error);
     throw error;
@@ -222,7 +210,6 @@ app.get('/api/health', (req, res) => {
       connected: !!mongoClient && !!db,
       collections: {
         sessions: !!sessionsCollection,
-        attempts: !!attemptsCollection,
         logs: !!logsCollection
       }
     },
@@ -332,235 +319,6 @@ app.post('/api/session/register', async (req, res) => {
 });
 
 /**
- * POST /api/attempt/register
- * Register a new checkout attempt ID
- */
-app.post('/api/attempt/register', async (req, res) => {
-  try {
-    let { 
-      attempt_id, 
-      session_token, 
-      checkout_url, 
-      ip_address, 
-      user_agent 
-    } = req.body;
-    
-    // Extract IP from request if not provided
-    if (!ip_address) {
-      ip_address = req.headers['x-forwarded-for']?.split(',')[0]?.trim() 
-                   || req.headers['x-real-ip']
-                   || req.connection.remoteAddress 
-                   || req.socket.remoteAddress
-                   || 'unknown';
-    }
-    
-    if (!attempt_id || !session_token) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'attempt_id and session_token are required' 
-      });
-    }
-    
-    // Validate attempt ID format
-    const attemptValidation = validateTokenFormat(attempt_id, '-', 5 * 60 * 1000);
-    if (!attemptValidation.valid) {
-      return res.status(400).json({ 
-        success: false, 
-        error: attemptValidation.error 
-      });
-    }
-    
-    // Verify session exists and is valid
-    const session = await sessionsCollection.findOne({ session_token });
-    
-    if (!session) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not found' 
-      });
-    }
-    
-    if (new Date() > new Date(session.expires_at)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Session expired' 
-      });
-    }
-    
-    // Calculate expiry (5 minutes from attempt creation)
-    const expiresAt = new Date(attemptValidation.timestamp + (5 * 60 * 1000));
-    
-    // Check if attempt already exists
-    const existingAttempt = await attemptsCollection.findOne({ attempt_id });
-    if (existingAttempt) {
-      return res.status(409).json({ 
-        success: false, 
-        error: 'Attempt ID already exists' 
-      });
-    }
-    
-    // Insert attempt
-    const attemptDoc = {
-      attempt_id,
-      session_token,
-      created_at: new Date(),
-      expires_at: expiresAt,
-      is_used: false,
-      used_at: null,
-      checkout_url,
-      order_id: null,
-      ip_address,
-      user_agent
-    };
-    
-    const result = await attemptsCollection.insertOne(attemptDoc);
-    
-    res.json({
-      success: true,
-      attempt: {
-        attempt_id,
-        expires_at: expiresAt
-      }
-    });
-    
-  } catch (error) {
-    console.error('Attempt registration error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Internal server error' 
-    });
-  }
-});
-
-/**
- * POST /api/shopify/validate
- * [DEPRECATED - NOT CURRENTLY USED]
- * 
- * Originally intended for Shopify Functions, but Shopify Functions 
- * do not have access to fetch() API for making HTTP requests.
- * 
- * Current implementation uses Checkout UI Extension instead,
- * which calls /api/validate endpoint.
- * 
- * Keeping this endpoint for future use if Shopify adds network 
- * capabilities to Functions.
- */
-app.post('/api/shopify/validate', async (req, res) => {
-  try {
-    let { session_token, attempt_id, buyer_journey_step } = req.body;
-    console.log('🔍 Shopify validation request:', { session_token: session_token?.substring(0, 20), attempt_id: attempt_id?.substring(0, 20), buyer_journey_step });
-    // Extract IP from request if not provided
-    if (!req.body.ip_address) {
-      const ip_address = req.headers['x-forwarded-for']?.split(',')[0]?.trim() 
-                   || req.headers['x-real-ip']
-                   || req.connection.remoteAddress 
-                   || req.socket.remoteAddress
-                   || 'shopify-function';
-      req.body.ip_address = ip_address;
-    }
-    
-    console.log(`🔍 Shopify validation request:`, { session_token: session_token?.substring(0, 20), attempt_id: attempt_id?.substring(0, 20), buyer_journey_step });
-    
-    if (!attempt_id || !session_token) {
-      await logValidation(attempt_id, session_token, 'invalid', 'Missing parameters', req.body.ip_address, 'Shopify-Function');
-      return res.status(400).json({ 
-        valid: false, 
-        error: 'session_token and attempt_id are required' 
-      });
-    }
-    
-    // Check attempt exists and session matches
-    const attempt = await attemptsCollection.findOne({ 
-      attempt_id, 
-      session_token 
-    });
-    
-    if (!attempt) {
-      await logValidation(attempt_id, session_token, 'invalid', 'Attempt not found or session mismatch', req.body.ip_address, 'Shopify-Function');
-      return res.status(404).json({ 
-        valid: false, 
-        error: 'Invalid checkout session. Please return to cart and try again.' 
-      });
-    }
-    
-    // Check if already used (ONE-TIME enforcement)
-    if (attempt.is_used) {
-      await logValidation(attempt_id, session_token, 'already_used', 
-        `Attempt already used at ${attempt.used_at}`, req.body.ip_address, 'Shopify-Function');
-      console.error(`❌ Attempt already used at ${attempt.used_at}`);
-      return res.status(409).json({ 
-        valid: false, 
-        error: 'This checkout URL has already been used. Please return to cart and start over.',
-        used_at: attempt.used_at
-      });
-    }
-    
-    // Check expiry
-    if (new Date() > new Date(attempt.expires_at)) {
-      await logValidation(attempt_id, session_token, 'expired', 
-        'Attempt expired', req.body.ip_address, 'Shopify-Function');
-      console.error(`❌ Attempt expired at ${attempt.expires_at}`);
-      return res.status(400).json({ 
-        valid: false, 
-        error: 'Checkout attempt has expired. Please return to cart and try again.' 
-      });
-    }
-    
-    // Mark as used (atomic operation to prevent race conditions)
-    const now = new Date();
-    const updateResult = await attemptsCollection.updateOne(
-      { attempt_id, is_used: false },
-      { 
-        $set: { 
-          is_used: true, 
-          used_at: now 
-        } 
-      }
-    );
-    
-    // If no documents were modified, it means another request already used it
-    if (updateResult.modifiedCount === 0) {
-      await logValidation(attempt_id, session_token, 'already_used', 
-        'Attempt was just used by another request (race condition)', req.body.ip_address, 'Shopify-Function');
-      console.error(`❌ Race condition: attempt already used by another request`);
-      return res.status(409).json({ 
-        valid: false, 
-        error: 'This checkout URL has already been used.'
-      });
-    }
-    
-    // Mark session as used
-    await sessionsCollection.updateOne(
-      { session_token },
-      { 
-        $set: { 
-          is_used: true, 
-          used_at: now 
-        } 
-      }
-    );
-    
-    await logValidation(attempt_id, session_token, 'success', null, req.body.ip_address, 'Shopify-Function');
-    console.log(`✅ Shopify validation passed - marked as USED`);
-    
-    res.json({
-      valid: true,
-      message: 'Validation successful',
-      attempt_id: attempt_id
-    });
-    
-  } catch (error) {
-    console.error('❌ Shopify validation error:', error.message);
-    await logValidation(req.body.attempt_id, req.body.session_token, 'error', 
-      error.message, req.body.ip_address, 'Shopify-Function');
-    res.status(500).json({ 
-      valid: false, 
-      error: 'Internal server error' 
-    });
-  }
-});
-
-/**
  * POST /api/validate
  * PAIR VALIDATION - Implements checkout_storage_id verification
  * Validates: (session_token, checkout_storage_id)
@@ -606,7 +364,7 @@ app.post('/api/validate', async (req, res) => {
     // Validate required parameters
     if (!session_token) {
       console.error('❌ Missing required parameter: session_token');
-      await logValidation(null, null, 'invalid', 'Missing session_token', ip_address, user_agent);
+      await logValidation(null, 'invalid', 'Missing session_token', ip_address, user_agent);
       return res.status(400).json({ 
         success: false, 
         error: 'session_token is required' 
@@ -624,7 +382,7 @@ app.post('/api/validate', async (req, res) => {
       
       if (!dbRecord) {
         console.error('🚨 INVALID: No matching session_token');
-        await logValidation(null, session_token, 'not_found', 
+        await logValidation(session_token, 'not_found', 
           'No matching session', ip_address, user_agent);
         return res.status(404).json({ 
           success: false,
@@ -636,7 +394,7 @@ app.post('/api/validate', async (req, res) => {
       // Theme validation - just check if exists and not expired
       if (dbRecord.expires_at && new Date() > new Date(dbRecord.expires_at)) {
         console.error('⏰ EXPIRED: Checkout session expired');
-        await logValidation(null, session_token, 'expired', 
+        await logValidation(session_token, 'expired', 
           'Session expired', ip_address, user_agent);
         return res.status(400).json({ 
           success: false,
@@ -646,7 +404,7 @@ app.post('/api/validate', async (req, res) => {
       }
       
       console.log('✅ Theme validation PASSED');
-      await logValidation(null, session_token, 'success', 
+      await logValidation(session_token, 'success', 
         'Theme validation successful', ip_address, user_agent);
       
       return res.status(200).json({ 
@@ -669,7 +427,7 @@ app.post('/api/validate', async (req, res) => {
     if (!dbRecord) {
       // No matching session_token in DB → BLOCK
       console.error('🚨 INVALID: No matching session_token in database');
-      await logValidation(null, session_token, 'not_found', 
+      await logValidation(session_token, 'not_found', 
         'No matching session', ip_address, user_agent);
       return res.status(404).json({ 
         success: false,
@@ -681,7 +439,7 @@ app.post('/api/validate', async (req, res) => {
     // Check if session has expired
     if (dbRecord.expires_at && new Date() > new Date(dbRecord.expires_at)) {
       console.error('⏰ EXPIRED: Checkout session expired');
-      await logValidation(null, session_token, 'expired', 
+      await logValidation(session_token, 'expired', 
         'Session expired', ip_address, user_agent);
       return res.status(400).json({ 
         success: false,
@@ -718,7 +476,7 @@ app.post('/api/validate', async (req, res) => {
           console.log('✅ Same checkout_storage_id - allowing');
         } else {
           console.error('🚨 Different checkout_storage_id - blocking');
-          await logValidation(null, session_token, 'storage_mismatch', 
+          await logValidation(session_token, 'storage_mismatch', 
             'Different checkout_storage_id (copied URL)', ip_address, user_agent);
           return res.status(403).json({ 
             success: false,
@@ -728,7 +486,7 @@ app.post('/api/validate', async (req, res) => {
         }
       }
       
-      await logValidation(null, session_token, 'success', 
+      await logValidation(session_token, 'success', 
         'First checkout - storage_id stored', ip_address, user_agent);
       
       console.log('✅ VALIDATION PASSED - First legitimate checkout');
@@ -753,7 +511,7 @@ app.post('/api/validate', async (req, res) => {
         }
       );
       
-      await logValidation(null, session_token, 'success', 
+      await logValidation(session_token, 'success', 
         'Same browser validation', ip_address, user_agent);
       
       console.log('✅ VALIDATION PASSED - Same browser');
@@ -772,7 +530,7 @@ app.post('/api/validate', async (req, res) => {
       console.error(`   Provided checkout_storage_id: ${checkout_storage_id.substring(0, 20)}...`);
       console.error(`   This checkout URL was copied to a different browser!`);
       
-      await logValidation(null, session_token, 'storage_mismatch', 
+      await logValidation(session_token, 'storage_mismatch', 
         'FRAUD: Different checkout_storage_id (copied URL to different browser)', 
         ip_address, user_agent);
       
@@ -834,75 +592,19 @@ app.get('/api/admin/stats', async (req, res) => {
     
     const now = new Date();
     const activeSessions = await sessionsCollection.countDocuments({
-      expires_at: { $gt: now },
-      is_used: false
-    });
-    
-    const activeAttempts = await attemptsCollection.countDocuments({
-      expires_at: { $gt: now },
-      is_used: false
+      expires_at: { $gt: now }
     });
     
     res.json({
       success: true,
       stats: {
         last_24_hours: statsMap,
-        active_sessions: activeSessions,
-        active_attempts: activeAttempts
+        active_sessions: activeSessions
       }
     });
     
   } catch (error) {
     console.error('Stats error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Internal server error' 
-    });
-  }
-});
-
-/**
- * GET /api/admin/attempts
- * View recent attempts (admin)
- */
-app.get('/api/admin/attempts', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 50;
-    const offset = parseInt(req.query.offset) || 0;
-    
-    const attempts = await attemptsCollection
-      .find({}, {
-        projection: {
-          _id: 0,
-          attempt_id: 1,
-          session_token: 1,
-          created_at: 1,
-          expires_at: 1,
-          is_used: 1,
-          used_at: 1,
-          ip_address: 1,
-          order_id: 1
-        }
-      })
-      .sort({ created_at: -1 })
-      .skip(offset)
-      .limit(limit)
-      .toArray();
-    
-    const total = await attemptsCollection.countDocuments();
-    
-    res.json({
-      success: true,
-      attempts,
-      pagination: {
-        limit,
-        offset,
-        total
-      }
-    });
-    
-  } catch (error) {
-    console.error('Attempts query error:', error);
     res.status(500).json({ 
       success: false, 
       error: 'Internal server error' 
@@ -968,10 +670,9 @@ app.post('/api/admin/cleanup', async (req, res) => {
 // AUDIT LOGGING
 // ============================================
 
-async function logValidation(attemptId, sessionToken, result, errorMessage, ipAddress, userAgent) {
+async function logValidation(sessionToken, result, errorMessage, ipAddress, userAgent) {
   try {
     await logsCollection.insertOne({
-      attempt_id: attemptId,
       session_token: sessionToken,
       validation_result: result,
       error_message: errorMessage,
@@ -1033,10 +734,8 @@ app.use((req, res) => {
     method: req.method,
     availableEndpoints: {
       session: 'POST /api/session/register',
-      attempt: 'POST /api/attempt/register',
       validate: 'POST /api/validate',
       stats: 'GET /api/admin/stats',
-      attempts: 'GET /api/admin/attempts',
       logs: 'GET /api/admin/logs',
       cleanup: 'POST /api/admin/cleanup',
       dashboard: 'GET /'
@@ -1072,10 +771,8 @@ async function startServer() {
       console.log(`📝 Admin Logs API: https://fraud-check-app.onrender.com:${PORT}/api/admin/logs`);
       console.log('\n🔗 Available Endpoints:');
       console.log('   POST /api/session/register');
-      console.log('   POST /api/attempt/register');
       console.log('   POST /api/validate');
       console.log('   GET  /api/admin/stats');
-      console.log('   GET  /api/admin/attempts');
       console.log('   GET  /api/admin/logs');
       console.log('   POST /api/admin/cleanup');
       console.log('='.repeat(50) + '\n');
