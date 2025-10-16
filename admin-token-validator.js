@@ -562,14 +562,24 @@ app.post('/api/shopify/validate', async (req, res) => {
 
 /**
  * POST /api/validate
- * Endpoint for Checkout UI Extension and theme-based validation
- * Used by: checkout_ui_extension, theme
+ * NEW TRIPLET VALIDATION - Implements checkout_storage_id verification
+ * Validates: (session_token, attemptID, checkout_storage_id)
+ * 
+ * Flow:
+ * 1. Theme registers at cart: (session_token, attemptID, null)
+ * 2. Extension sends at checkout: (session_token, attemptID, checkout_storage_id)
+ * 3. Backend validates:
+ *    - If all three match → ALLOW (same browser, refresh)
+ *    - If session+attempt match, storage_id is null in DB → ALLOW + UPDATE (first legitimate checkout)
+ *    - If session+attempt match, storage_id differs → BLOCK (copied URL, different browser)
+ *    - If no match → BLOCK (invalid)
  */
 app.post('/api/validate', async (req, res) => {
   try {
     let { 
       attempt_id, 
       session_token,
+      checkout_storage_id, // NEW: Browser-specific storage ID from extension
       source, // 'checkout_ui_extension' or 'theme'
       ip_address, 
       user_agent 
@@ -589,127 +599,146 @@ app.post('/api/validate', async (req, res) => {
       user_agent = source || req.headers['user-agent'] || 'unknown';
     }
     
-    console.log(`🔍 Validation request from: ${source || 'unknown'}`);
-    console.log(`   Attempt ID: ${attempt_id?.substring(0, 20)}...`);
+    console.log(`🔍 NEW TRIPLET VALIDATION from: ${source || 'unknown'}`);
     console.log(`   Session Token: ${session_token?.substring(0, 20)}...`);
+    console.log(`   Attempt ID: ${attempt_id?.substring(0, 20)}...`);
+    console.log(`   Checkout Storage ID: ${checkout_storage_id?.substring(0, 20)}...`);
     console.log(`   IP Address: ${ip_address}`);
     
-    if (!attempt_id || !session_token) {
-      await logValidation(null, null, 'invalid', 'Missing parameters', ip_address, user_agent);
+    // Validate required parameters
+    if (!attempt_id || !session_token || !checkout_storage_id) {
+      console.error('❌ Missing required parameters');
+      await logValidation(null, null, 'invalid', 'Missing required parameters', ip_address, user_agent);
       return res.status(400).json({ 
         success: false, 
-        error: 'attempt_id and session_token are required' 
+        error: 'session_token, attempt_id, and checkout_storage_id are required' 
       });
     }
     
-    // ===== CRITICAL SECURITY CHECK =====
-    // Check if attempt_id exists with ANY session_token first
-    const attemptExists = await attemptsCollection.findOne({ attempt_id });
+    // ===== TRIPLET VALIDATION LOGIC =====
+    // Find the record with matching session_token and attempt_id
+    const dbRecord = await attemptsCollection.findOne({ 
+      session_token, 
+      attempt_id 
+    });
     
-    if (attemptExists) {
-      // Attempt ID exists - now check if session_token matches
-      if (attemptExists.session_token !== session_token) {
-        // FRAUD DETECTED: Someone is trying to use a checkout URL with a different session
-        // This means they copied the /checkout/cn/... URL to another browser/device
-        console.error('🚨 FRAUD ATTEMPT DETECTED!');
-        console.error(`   Attempt ID: ${attempt_id.substring(0, 20)}...`);
-        console.error(`   Original Session: ${attemptExists.session_token.substring(0, 20)}...`);
-        console.error(`   Provided Session: ${session_token.substring(0, 20)}...`);
-        console.error(`   IP Address: ${ip_address}`);
-        
-        await logValidation(attempt_id, session_token, 'session_mismatch', 
-          'FRAUD: Attempt ID used with different session token (copied checkout URL)', 
-          ip_address, user_agent);
-        
-        return res.status(403).json({ 
-          success: false,
-          valid: false,
-          error: 'Invalid checkout session. This checkout URL cannot be used from a different browser or device. Please return to your cart and checkout again.' 
-        });
-      } else {
-        if (attemptExists.attempt_id === attempt_id)  {
-          // This is the same user, allow to continue
-          console.log('✅ Session token matches - same user');
-          return res.status(200).json({ 
-            success: true,
-            valid: true,
-            message: 'Checkout validated successfully' 
+    if (!dbRecord) {
+      // Case D: No matching (session_token, attempt_id) in DB → BLOCK
+      console.error('🚨 INVALID: No matching session_token + attempt_id in database');
+      await logValidation(attempt_id, session_token, 'not_found', 
+        'No matching session and attempt', ip_address, user_agent);
+      return res.status(404).json({ 
+        success: false,
+        valid: false,
+        error: 'Checkout session not found. Please return to cart and try again.' 
+      });
+    }
+    
+    // Check if session/attempt has expired
+    if (dbRecord.expires_at && new Date() > new Date(dbRecord.expires_at)) {
+      console.error('⏰ EXPIRED: Checkout session expired');
+      await logValidation(attempt_id, session_token, 'expired', 
+        'Session expired', ip_address, user_agent);
+      return res.status(400).json({ 
+        success: false,
+        valid: false,
+        error: 'Checkout session has expired. Please return to cart and try again.' 
+      });
+    }
+    
+    console.log(`📋 DB Record found: checkout_storage_id = ${dbRecord.checkout_storage_id || 'NULL'}`);
+    
+    // Now check checkout_storage_id
+    if (!dbRecord.checkout_storage_id || dbRecord.checkout_storage_id === '') {
+      // Case B: session_token + attempt_id match, but checkout_storage_id is NULL in DB
+      // This is the FIRST legitimate checkout → ALLOW + UPDATE
+      console.log('✅ FIRST CHECKOUT: checkout_storage_id is NULL in DB → Storing new checkout_storage_id');
+      
+      const updateResult = await attemptsCollection.updateOne(
+        { session_token, attempt_id, checkout_storage_id: { $in: [null, ''] } },
+        { 
+          $set: { 
+            checkout_storage_id: checkout_storage_id,
+            first_checkout_at: new Date(),
+            last_validated_at: new Date()
+          } 
+        }
+      );
+      
+      if (updateResult.modifiedCount === 0) {
+        // Race condition: another request just updated it
+        console.error('⚠️ RACE CONDITION: checkout_storage_id was just set by another request');
+        // Re-fetch and compare
+        const updatedRecord = await attemptsCollection.findOne({ session_token, attempt_id });
+        if (updatedRecord.checkout_storage_id === checkout_storage_id) {
+          console.log('✅ Same checkout_storage_id - allowing');
+        } else {
+          console.error('🚨 Different checkout_storage_id - blocking');
+          await logValidation(attempt_id, session_token, 'storage_mismatch', 
+            'Different checkout_storage_id (copied URL)', ip_address, user_agent);
+          return res.status(403).json({ 
+            success: false,
+            valid: false,
+            error: 'This checkout URL cannot be used from a different browser or device. Please return to cart and checkout again.' 
           });
         }
       }
+      
+      await logValidation(attempt_id, session_token, 'success', 
+        'First checkout - storage_id stored', ip_address, user_agent);
+      
+      console.log('✅ VALIDATION PASSED - First legitimate checkout');
+      return res.status(200).json({ 
+        success: true,
+        valid: true,
+        message: 'Checkout validated successfully (first checkout)',
+        first_checkout: true
+      });
+      
+    } else if (dbRecord.checkout_storage_id === checkout_storage_id) {
+      // Case A: All three match → ALLOW (same browser, refresh or revisit)
+      console.log('✅ ALL MATCH: Same browser refresh/revisit');
+      
+      // Update last validated time
+      await attemptsCollection.updateOne(
+        { session_token, attempt_id },
+        { 
+          $set: { 
+            last_validated_at: new Date()
+          } 
+        }
+      );
+      
+      await logValidation(attempt_id, session_token, 'success', 
+        'Same browser validation', ip_address, user_agent);
+      
+      console.log('✅ VALIDATION PASSED - Same browser');
+      return res.status(200).json({ 
+        success: true,
+        valid: true,
+        message: 'Checkout validated successfully (same browser)',
+        same_browser: true
+      });
+      
     } else {
-      // Attempt ID doesn't exist at all
-      await logValidation(attempt_id, session_token, 'invalid', 'Attempt not found', ip_address, user_agent);
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Checkout attempt not found. Please return to cart and try again.' 
+      // Case C: session_token + attempt_id match, but checkout_storage_id is DIFFERENT
+      // This is a COPIED URL from different browser → BLOCK
+      console.error('🚨 COPIED URL DETECTED!');
+      console.error(`   Expected checkout_storage_id: ${dbRecord.checkout_storage_id.substring(0, 20)}...`);
+      console.error(`   Provided checkout_storage_id: ${checkout_storage_id.substring(0, 20)}...`);
+      console.error(`   This checkout URL was copied to a different browser!`);
+      
+      await logValidation(attempt_id, session_token, 'storage_mismatch', 
+        'FRAUD: Different checkout_storage_id (copied URL to different browser)', 
+        ip_address, user_agent);
+      
+      return res.status(403).json({ 
+        success: false,
+        valid: false,
+        error: 'This checkout URL cannot be used from a different browser or device. Please return to cart and checkout again.',
+        reason: 'copied_url_detected'
       });
     }
-    
-    // At this point, we know the attempt exists AND the session matches
-    const attempt = attemptExists;
-    
-    // Check if already used
-    if (attempt.is_used) {
-      await logValidation(attempt_id, session_token, 'already_used', 
-        `Attempt already used at ${attempt.used_at}`, ip_address, user_agent);
-      return res.status(409).json({ 
-        success: false, 
-        error: 'Checkout attempt already used',
-        used_at: attempt.used_at
-      });
-    }
-    
-    // Check expiry
-    if (new Date() > new Date(attempt.expires_at)) {
-      await logValidation(attempt_id, session_token, 'expired', 
-        'Attempt expired', ip_address, user_agent);
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Checkout attempt has expired' 
-      });
-    }
-    
-    // Mark as used (atomic operation to prevent race conditions)
-    const now = new Date();
-    const updateResult = await attemptsCollection.updateOne(
-      { attempt_id, is_used: false },
-      { 
-        $set: { 
-          is_used: true, 
-          used_at: now 
-        } 
-      }
-    );
-    
-    // If no documents were modified, it means another request already used it
-    if (updateResult.modifiedCount === 0) {
-      await logValidation(attempt_id, session_token, 'already_used', 
-        'Attempt was just used by another request', ip_address, user_agent);
-      return res.status(409).json({ 
-        success: false, 
-        error: 'Checkout attempt already used'
-      });
-    }
-    
-    // Mark session as used
-    await sessionsCollection.updateOne(
-      { session_token },
-      { 
-        $set: { 
-          is_used: true, 
-          used_at: now 
-        } 
-      }
-    );
-    
-    await logValidation(attempt_id, session_token, 'success', null, ip_address, user_agent);
-    
-    res.json({
-      success: true,
-      message: 'Checkout validated successfully',
-      attempt_id: attempt_id
-    });
     
   } catch (error) {
     console.error('Validation error:', error);
