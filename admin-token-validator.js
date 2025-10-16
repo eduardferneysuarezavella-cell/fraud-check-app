@@ -599,21 +599,69 @@ app.post('/api/validate', async (req, res) => {
       user_agent = source || req.headers['user-agent'] || 'unknown';
     }
     
-    console.log(`🔍 NEW TRIPLET VALIDATION from: ${source || 'unknown'}`);
+    console.log(`🔍 VALIDATION REQUEST from: ${source || 'unknown'}`);
     console.log(`   Session Token: ${session_token?.substring(0, 20)}...`);
     console.log(`   Attempt ID: ${attempt_id?.substring(0, 20)}...`);
-    console.log(`   Checkout Storage ID: ${checkout_storage_id?.substring(0, 20)}...`);
+    console.log(`   Checkout Storage ID: ${checkout_storage_id?.substring(0, 20) || 'NULL'}...`);
     console.log(`   IP Address: ${ip_address}`);
     
     // Validate required parameters
-    if (!attempt_id || !session_token || !checkout_storage_id) {
-      console.error('❌ Missing required parameters');
+    if (!attempt_id || !session_token) {
+      console.error('❌ Missing required parameters (session_token or attempt_id)');
       await logValidation(null, null, 'invalid', 'Missing required parameters', ip_address, user_agent);
       return res.status(400).json({ 
         success: false, 
-        error: 'session_token, attempt_id, and checkout_storage_id are required' 
+        error: 'session_token and attempt_id are required' 
       });
     }
+    
+    // If request is from theme (no checkout_storage_id), use OLD validation logic
+    if (!checkout_storage_id || source === 'theme') {
+      console.log('⚠️ Theme validation (no checkout_storage_id) - using legacy validation');
+      
+      // Find the attempt
+      const dbRecord = await attemptsCollection.findOne({ 
+        session_token, 
+        attempt_id 
+      });
+      
+      if (!dbRecord) {
+        console.error('🚨 INVALID: No matching session_token + attempt_id');
+        await logValidation(attempt_id, session_token, 'not_found', 
+          'No matching session and attempt', ip_address, user_agent);
+        return res.status(404).json({ 
+          success: false,
+          valid: false,
+          error: 'Checkout session not found. Please return to cart and try again.' 
+        });
+      }
+      
+      // Theme validation - just check if exists and not expired
+      if (dbRecord.expires_at && new Date() > new Date(dbRecord.expires_at)) {
+        console.error('⏰ EXPIRED: Checkout session expired');
+        await logValidation(attempt_id, session_token, 'expired', 
+          'Session expired', ip_address, user_agent);
+        return res.status(400).json({ 
+          success: false,
+          valid: false,
+          error: 'Checkout session has expired. Please return to cart and try again.' 
+        });
+      }
+      
+      console.log('✅ Theme validation PASSED');
+      await logValidation(attempt_id, session_token, 'success', 
+        'Theme validation successful', ip_address, user_agent);
+      
+      return res.status(200).json({ 
+        success: true,
+        valid: true,
+        message: 'Checkout validated successfully (theme)',
+        theme_validation: true
+      });
+    }
+    
+    // ===== TRIPLET VALIDATION (Extension with checkout_storage_id) =====
+    console.log('🔒 TRIPLET VALIDATION MODE - checkout_storage_id provided');
     
     // ===== TRIPLET VALIDATION LOGIC =====
     // Find the record with matching session_token and attempt_id
