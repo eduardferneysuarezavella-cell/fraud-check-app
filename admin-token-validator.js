@@ -603,41 +603,10 @@ app.post('/api/validate', async (req, res) => {
     }
     
     // ===== CRITICAL SECURITY CHECK =====
-    // Check if attempt_id exists with ANY session_token first
+    // Check if attempt_id exists in database
     const attemptExists = await attemptsCollection.findOne({ attempt_id });
     
-    if (attemptExists) {
-      // Attempt ID exists - now check if session_token matches
-      if (attemptExists.session_token !== session_token) {
-        // FRAUD DETECTED: Someone is trying to use a checkout URL with a different session
-        // This means they copied the /checkout/cn/... URL to another browser/device
-        console.error('🚨 FRAUD ATTEMPT DETECTED!');
-        console.error(`   Attempt ID: ${attempt_id.substring(0, 20)}...`);
-        console.error(`   Original Session: ${attemptExists.session_token.substring(0, 20)}...`);
-        console.error(`   Provided Session: ${session_token.substring(0, 20)}...`);
-        console.error(`   IP Address: ${ip_address}`);
-        
-        await logValidation(attempt_id, session_token, 'session_mismatch', 
-          'FRAUD: Attempt ID used with different session token (copied checkout URL)', 
-          ip_address, user_agent);
-        
-        return res.status(403).json({ 
-          success: false,
-          valid: false,
-          error: 'Invalid checkout session. This checkout URL cannot be used from a different browser or device. Please return to your cart and checkout again.' 
-        });
-      } else {
-        if (attemptExists.attempt_id === attempt_id)  {
-          // This is the same user, allow to continue
-          console.log('✅ Session token matches - same user');
-          return res.status(200).json({ 
-            success: true,
-            valid: true,
-            message: 'Checkout validated successfully' 
-          });
-        }
-      }
-    } else {
+    if (!attemptExists) {
       // Attempt ID doesn't exist at all
       await logValidation(attempt_id, session_token, 'invalid', 'Attempt not found', ip_address, user_agent);
       return res.status(404).json({ 
@@ -646,8 +615,31 @@ app.post('/api/validate', async (req, res) => {
       });
     }
     
-    // At this point, we know the attempt exists AND the session matches
+    // Attempt exists - verify session token matches
+    // NOTE: Shopify stores cart attributes server-side, so tokens will be identical
+    // even if checkout URL is opened in different browsers. This check is mainly
+    // for detecting tampering attempts, not different browsers.
+    if (attemptExists.session_token !== session_token) {
+      console.error('🚨 TOKEN MISMATCH DETECTED!');
+      console.error(`   Attempt ID: ${attempt_id.substring(0, 20)}...`);
+      console.error(`   Expected Session: ${attemptExists.session_token.substring(0, 20)}...`);
+      console.error(`   Provided Session: ${session_token.substring(0, 20)}...`);
+      console.error(`   IP Address: ${ip_address}`);
+      
+      await logValidation(attempt_id, session_token, 'session_mismatch', 
+        'Session token mismatch (possible tampering)', 
+        ip_address, user_agent);
+      
+      return res.status(403).json({ 
+        success: false,
+        valid: false,
+        error: 'Invalid checkout session. Please return to your cart and checkout again.' 
+      });
+    }
+    
+    // Session tokens match - continue with ONE-TIME USE validation
     const attempt = attemptExists;
+    console.log('✅ Session token matches - checking one-time use enforcement...');
     
     // Check if already used
     if (attempt.is_used) {
